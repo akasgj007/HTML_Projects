@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Local PDF Metadata Editor (Client-side)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    :root { --maxw: 900px; --pad: 14px; }
+    body { font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin:30px auto; max-width:var(--maxw); padding:0 16px; color:#111; }
+    h1 { margin:0 0 8px 0; font-size:20px; }
+    p.lead { margin:4px 0 16px 0; color:#444; font-size:14px; }
+    .card { border:1px solid #e6e6e6; padding:var(--pad); border-radius:8px; box-shadow:0 1px 2px rgba(0,0,0,0.02); background:#fff; }
+    label { display:block; font-weight:600; margin-top:12px; font-size:13px; }
+    input[type="text"], textarea { width:100%; padding:10px; margin-top:6px; box-sizing:border-box; font-size:14px; border-radius:6px; border:1px solid #ddd; }
+    .row { display:flex; gap:10px; align-items:center; margin-top:12px; flex-wrap:wrap; }
+    button { appearance:none; border:0; background:#2563eb; color:white; padding:10px 14px; border-radius:8px; cursor:pointer; font-weight:600; }
+    button.secondary { background:#6b7280; }
+    button.ghost { background:transparent; color:#111; border:1px solid #ddd; }
+    pre { background:#fafafa; padding:10px; border-radius:6px; margin-top:10px; overflow:auto; border:1px solid #eee; font-size:13px; }
+    .note { color:#6b7280; margin-top:10px; font-size:13px; }
+    .small { font-size:13px; color:#4b5563; }
+    .flex { display:flex; gap:10px; }
+    .col { flex:1; }
+    footer { margin-top:18px; color:#6b7280; font-size:13px; }
+    .spinner { display:inline-block; width:18px; height:18px; border:3px solid rgba(0,0,0,0.08); border-top-color:rgba(0,0,0,0.4); border-radius:50%; animation:spin 0.8s linear infinite; vertical-align:middle; margin-left:8px; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1>Local PDF Metadata Editor</h1>
+  <p class="lead">Load a PDF from your machine, edit the metadata fields (Title, Author, Subject, Keywords) and download the updated PDF. Everything runs in your browser — no upload, no cost.</p>
+
+  <div class="card" id="app">
+    <label for="fileInput">Choose PDF</label>
+    <input id="fileInput" type="file" accept="application/pdf" />
+
+    <div class="row" style="margin-top:12px;">
+      <button id="btnLoad">Load Metadata</button>
+      <button id="btnClear" class="secondary">Clear</button>
+      <div id="status" style="margin-left:auto" class="small"></div>
+    </div>
+
+    <div id="formArea" style="display:none; margin-top:14px;">
+      <label for="metaTitle">Title</label>
+      <input id="metaTitle" type="text" placeholder="Document title" />
+
+      <label for="metaAuthor">Author</label>
+      <input id="metaAuthor" type="text" placeholder="Author name" />
+
+      <label for="metaSubject">Subject</label>
+      <input id="metaSubject" type="text" placeholder="Subject" />
+
+      <label for="metaKeywords">Keywords (comma separated)</label>
+      <input id="metaKeywords" type="text" placeholder="keyword1, keyword2" />
+
+      <label>Raw (read-only) metadata read from Info dictionary</label>
+      <pre id="rawInfo">-</pre>
+
+      <div class="row">
+        <button id="btnSave">Save & Download Edited PDF</button>
+        <button id="btnReset" class="ghost">Reset to Original</button>
+        <div style="margin-left:auto" class="small">Output: <span id="outname">-</span></div>
+      </div>
+
+      <p class="note">Note: This edits the PDF <strong>Info</strong> dictionary (Title, Author, Subject, Keywords). Some PDFs use <strong>XMP</strong> metadata — this tool may not update XMP packets. If you need XMP editing, ask and I'll provide a local script (free).</p>
+    </div>
+  </div>
+
+  <footer>Open the file using Chrome / Edge / Firefox for best results.</footer>
+
+  <!-- pdf-lib CDN -->
+  <script src="https://unpkg.com/pdf-lib@2.14.0/dist/pdf-lib.min.js"></script>
+
+  <script>
+  (function () {
+    // Short alias
+    const { PDFDocument } = window.pdfLib || {};
+
+    // DOM refs
+    const fileInput = document.getElementById('fileInput');
+    const btnLoad = document.getElementById('btnLoad');
+    const btnClear = document.getElementById('btnClear');
+    const status = document.getElementById('status');
+    const formArea = document.getElementById('formArea');
+    const rawInfo = document.getElementById('rawInfo');
+    const metaTitle = document.getElementById('metaTitle');
+    const metaAuthor = document.getElementById('metaAuthor');
+    const metaSubject = document.getElementById('metaSubject');
+    const metaKeywords = document.getElementById('metaKeywords');
+    const btnSave = document.getElementById('btnSave');
+    const btnReset = document.getElementById('btnReset');
+    const outname = document.getElementById('outname');
+
+    let originalBytes = null;
+    let originalMeta = null;
+    let originalFilename = 'document.pdf';
+
+    function setStatus(text, busy=false) {
+      status.innerHTML = text + (busy ? ' <span class="spinner"></span>' : '');
+    }
+
+    btnClear.addEventListener('click', () => {
+      fileInput.value = '';
+      formArea.style.display = 'none';
+      rawInfo.textContent = '-';
+      setStatus('');
+      originalBytes = null;
+      originalMeta = null;
+      outname.textContent = '-';
+    });
+
+    btnLoad.addEventListener('click', async () => {
+      setStatus('Reading file...', true);
+      formArea.style.display = 'none';
+      rawInfo.textContent = '...';
+
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) {
+        alert('Please select a PDF file first.');
+        setStatus('');
+        rawInfo.textContent = '-';
+        return;
+      }
+      if (!f.name.toLowerCase().endsWith('.pdf')) {
+        alert('Please select a PDF file (extension .pdf).');
+        setStatus('');
+        rawInfo.textContent = '-';
+        return;
+      }
+
+      originalFilename = f.name;
+      try {
+        const ab = await f.arrayBuffer();
+        originalBytes = ab;
+
+        // Load with pdf-lib
+        if (!PDFDocument) throw new Error('pdf-lib failed to load');
+        const pdfDoc = await PDFDocument.load(ab, { updateMetadata: false });
+
+        // Attempt high-level getters
+        let meta = { Title:'', Author:'', Subject:'', Keywords:'' };
+        try {
+          if (typeof pdfDoc.getTitle === 'function') meta.Title = pdfDoc.getTitle() || '';
+          if (typeof pdfDoc.getAuthor === 'function') meta.Author = pdfDoc.getAuthor() || '';
+          if (typeof pdfDoc.getSubject === 'function') meta.Subject = pdfDoc.getSubject() || '';
+          if (typeof pdfDoc.getKeywords === 'function') {
+            const k = pdfDoc.getKeywords();
+            meta.Keywords = Array.isArray(k) ? k.join(', ') : (k || '');
+          }
+        } catch (e) {
+          console.warn('High-level getters not available', e);
+        }
+
+        // Fallback: inspect Info dictionary via low-level API
+        try {
+          const infoRef = pdfDoc.context.trailer.get('Info');
+          if (infoRef) {
+            const info = pdfDoc.context.lookup(infoRef);
+            if (info && info.dict) {
+              for (const [key, val] of info.dict.entries()) {
+                const nk = String(key);
+                const v = pdfDoc.context.lookup(val);
+                const sval = (v && v.value) ? String(v.value) : (v ? String(v) : '');
+                if (/Title/i.test(nk) && !meta.Title) meta.Title = sval;
+                if (/Author/i.test(nk) && !meta.Author) meta.Author = sval;
+                if (/Subject/i.test(nk) && !meta.Subject) meta.Subject = sval;
+                if (/Keywords/i.test(nk) && !meta.Keywords) meta.Keywords = sval;
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('Low-level Info inspection failed', e);
+        }
+
+        // populate UI
+        originalMeta = { ...meta };
+        metaTitle.value = meta.Title || '';
+        metaAuthor.value = meta.Author || '';
+        metaSubject.value = meta.Subject || '';
+        metaKeywords.value = meta.Keywords || '';
+        rawInfo.textContent = JSON.stringify(meta, null, 2);
+        formArea.style.display = 'block';
+        outname.textContent = originalFilename.replace(/\.pdf$/i, '') + '-meta.pdf';
+        setStatus('File loaded. Edit fields and click Save & Download.');
+      } catch (err) {
+        console.error(err);
+        alert('Failed to read PDF: ' + (err.message || err));
+        rawInfo.textContent = '-';
+        setStatus('');
+      }
+    });
+
+    btnReset.addEventListener('click', () => {
+      if (!originalMeta) return;
+      metaTitle.value = originalMeta.Title || '';
+      metaAuthor.value = originalMeta.Author || '';
+      metaSubject.value = originalMeta.Subject || '';
+      metaKeywords.value = originalMeta.Keywords || '';
+    });
+
+    btnSave.addEventListener('click', async () => {
+      if (!originalBytes) { alert('Load a PDF first'); return; }
+      setStatus('Saving updated PDF...', true);
+      btnSave.disabled = true;
+
+      try {
+        const pdfDoc = await PDFDocument.load(originalBytes);
+
+        // Use setters when available
+        try {
+          if (typeof pdfDoc.setTitle === 'function') pdfDoc.setTitle(metaTitle.value);
+          if (typeof pdfDoc.setAuthor === 'function') pdfDoc.setAuthor(metaAuthor.value);
+          if (typeof pdfDoc.setSubject === 'function') pdfDoc.setSubject(metaSubject.value);
+          if (typeof pdfDoc.setKeywords === 'function') pdfDoc.setKeywords(metaKeywords.value);
+        } catch (e) {
+          console.warn('High-level setters failed', e);
+        }
+
+        // Save bytes
+        const newBytes = await pdfDoc.save();
+
+        // Trigger download
+        const blob = new Blob([new Uint8Array(newBytes)], { type: 'application/pdf' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        const out = originalFilename.replace(/\.pdf$/i, '') + '-meta.pdf';
+        a.download = out;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+
+        setStatus('Downloaded: ' + out);
+      } catch (err) {
+        console.error(err);
+        alert('Failed to save PDF: ' + (err.message || err));
+        setStatus('');
+      } finally {
+        btnSave.disabled = false;
+      }
+    });
+
+    // Optional: quick keyboard support - Enter on file input triggers load
+    fileInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') btnLoad.click();
+    });
+
+  })();
+  </script>
+</body>
+</html>
